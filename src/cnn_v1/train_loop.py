@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, math, time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
@@ -93,12 +93,13 @@ def _build_criterion(cfg: Dict[str, Any], device: str | torch.device = "cpu") ->
     """
     Build loss by task type.
     - classification  -> CrossEntropyLoss (optionally with class weights / label smoothing)
-    - regression      -> MSELoss
+    - regression      -> SmoothL1Loss (Huber) with configurable beta
     """
     task = str(cfg.get('task', 'classification')).lower()
     if task in ('regression', 'mtl_regression', 'multi_target_regression'):
-        # Multi-target regression: predict a vector and minimize MSE
-        return nn.MSELoss()
+        # --- 修改：MSE 改为 SmoothL1(Huber)，抑制离群点 ---
+        huber_beta = float(cfg.get('train', {}).get('huber_beta', 1.0))
+        return nn.SmoothL1Loss(beta=huber_beta, reduction="mean")
     # === default: classification ===
     loss_cfg = cfg.get('loss', {})
     label_smoothing = float(loss_cfg.get('label_smoothing', 0.0))
@@ -159,7 +160,7 @@ def infer_n_channels(sample_batch) -> int:
     return c5
 
 
-# ===== 新增：带 BN/bias 排除的参数分组优化器构造 =====
+# ===== 修改增强：带 BN/Norm/bias 排除的参数分组优化器构造（AdamW） =====
 def build_optimizer_with_bn_exclusion(model, optim_cfg):
     import torch
     import torch.nn as nn
@@ -167,10 +168,13 @@ def build_optimizer_with_bn_exclusion(model, optim_cfg):
     wd = float(optim_cfg.get('weight_decay', 1e-2))
     decay, no_decay = [], []
 
-    for name, module in model.named_modules():
-        if isinstance(module, nn.BatchNorm1d):
-            # BN 的 weight/bias 一律不做权重衰减
-            for p in [module.weight, module.bias]:
+    # 不做权重衰减的模块：各类 *Norm（BN/LayerNorm/GroupNorm/InstanceNorm）以及 bias
+    norm_types = (nn.BatchNorm1d, nn.BatchNorm2d, nn.GroupNorm, nn.LayerNorm,
+                  nn.InstanceNorm1d, nn.InstanceNorm2d)
+
+    for module in model.modules():
+        if isinstance(module, norm_types):
+            for p in [getattr(module, 'weight', None), getattr(module, 'bias', None)]:
                 if p is not None and p.requires_grad:
                     no_decay.append(p)
 
@@ -191,15 +195,65 @@ def build_optimizer_with_bn_exclusion(model, optim_cfg):
         {"params": no_decay, "weight_decay": 0.0},
     ]
 
-    opt_name = str(optim_cfg.get('optimizer', 'adamw')).lower()
-    if opt_name == "adam":
-        return torch.optim.Adam(param_groups, lr=lr)
-    else:
-        return torch.optim.AdamW(param_groups, lr=lr)
+    # 强制 AdamW（与补丁一致）
+    return torch.optim.AdamW(param_groups, lr=lr)
+
+
+def _maybe_standardize_targets(y: torch.Tensor,
+                               y_mean: Optional[torch.Tensor],
+                               y_std: Optional[torch.Tensor]) -> torch.Tensor:
+    if y_mean is None or y_std is None:
+        return y
+    return (y - y_mean) / (y_std + 1e-8)
+
+
+def _maybe_destandardize_preds(y_hat: torch.Tensor,
+                               y_mean: Optional[torch.Tensor],
+                               y_std: Optional[torch.Tensor]) -> torch.Tensor:
+    if y_mean is None or y_std is None:
+        return y_hat
+    return y_hat * (y_std + 1e-8) + y_mean
+
+
+@torch.no_grad()
+def _compute_target_stats(dataset, batch_size: int = 8192) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    仅用于回归任务：遍历一次训练集计算 y 的均值与标准差（逐目标维度）。
+    放在 CPU 上计算，返回 torch.float32，一维形状 (D,)
+    """
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    n = 0
+    m = None
+    s = None
+    for batch in loader:
+        y = batch['label']
+        y = y.view(y.size(0), -1).to(dtype=torch.float64)  # 防溢出
+        if m is None:
+            D = y.size(1)
+            m = torch.zeros(D, dtype=torch.float64)
+            s = torch.zeros(D, dtype=torch.float64)
+        n_batch = y.size(0)
+        n_new = n + n_batch
+        delta = y.mean(dim=0) - m
+        m = m + delta * (n_batch / max(1, n_new))
+        # 逐批近似：累加方差（这里采用两阶段：先累加二阶矩，再减均值平方）
+        s = s + (y**2).sum(dim=0)
+        n = n_new
+    if n == 0:
+        # 兜底：全零均值，单位方差
+        return torch.zeros(1, dtype=torch.float32), torch.ones(1, dtype=torch.float32)
+    # E[x^2] - (E[x])^2
+    ex2 = s / n
+    var = torch.clamp(ex2 - (m**2), min=0.0)
+    mean = m.to(dtype=torch.float32)
+    std = torch.sqrt(var).to(dtype=torch.float32)
+    return mean, std
 
 
 def train_one_epoch(model, loader, optimizer, device, criterion, task, num_classes,
-                    scaler=None, amp_enabled=False, head_only: bool=False):
+                    scaler=None, amp_enabled=False, head_only: bool=False,
+                    y_mean: Optional[torch.Tensor]=None, y_std: Optional[torch.Tensor]=None,
+                    grad_clip: float = 0.0, standardize_targets: bool = False):
     model.train()
     loss_meter = AverageMeter()
     correct=0; total=0; i_SNW = 0
@@ -217,21 +271,12 @@ def train_one_epoch(model, loader, optimizer, device, criterion, task, num_class
                 m5 = x5.mean().item(); s5 = x5.std().item()
                 m3 = x3.mean().item(); s3 = x3.std().item()
             print(f"[debug] x5 mean={m5:.4f} std={s5:.4f} | x3 mean={m3:.4f} std={s3:.4f}")
-            # --- 检查 2）：第一批标签直方图（只打印一次） ---
-            #y_np = y.detach().cpu().numpy()
-            #counts = np.bincount(y_np, minlength=int(num_classes))
-
-            # 对于回归任务（y 为浮点或多维），不要用 bincount
+            # 对于分类，打印直方图；回归则跳过
             is_regression = (num_classes is None) or torch.is_floating_point(y)
             if not is_regression:
                 y_np = y.detach().view(-1).to(torch.int64).cpu().numpy()
                 counts = np.bincount(y_np, minlength=int(num_classes))
-            else:
-                counts = None
-                # 如需日志统计，可用直方图（可选）
-                # y_hist, y_edges = np.histogram(y.detach().view(-1).cpu().numpy(), bins=10)
-
-            #print("[debug] label hist (first batch):", counts.tolist(), "sum=", int(counts.sum()))
+                #print("[debug] label hist (first batch):", counts.tolist(), "sum=", int(counts.sum()))
             # --- 新增：主干特征统计（只打印一次） ---
             try:
                 with torch.no_grad():
@@ -241,11 +286,10 @@ def train_one_epoch(model, loader, optimizer, device, criterion, task, num_class
                 print(f"[debug] f5 std={s_f5:.4f} f3 std={s_f3:.4f} h std={s_h:.4f}")
             except Exception as _e:
                 print("[debug] trunk feature stats skipped:", repr(_e))
-            # --- 新增：只训 head 时确认可训练参数数量（只打印一次） ---
             if head_only:
                 n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
                 print(f"[debug] head-only mode enabled, trainable params={n_trainable}")
-            # --- 新增：BN γ 监控（只在每个 epoch 的第一批后打印一次） ---
+            # BN γ 监控
             with torch.no_grad():
                 gammas = [m.weight.detach().abs().mean().item()
                           for m in model.modules() if isinstance(m, nn.BatchNorm1d)]
@@ -254,13 +298,24 @@ def train_one_epoch(model, loader, optimizer, device, criterion, task, num_class
                 else:
                     print("[debug] bn.gamma monitor: no BatchNorm1d modules found")
 
+        # === 新增：可选标准化 y（仅回归） ===
+        if standardize_targets and task.startswith('reg'):
+            y_for_loss = _maybe_standardize_targets(y.float(), y_mean, y_std)
+        else:
+            y_for_loss = y.float() if task.startswith('reg') else y
+
         optimizer.zero_grad(set_to_none=True)
         if amp_enabled and scaler is not None:
             with torch.cuda.amp.autocast():
                 logits = model(x5, x3)
-                loss = criterion(logits, y.float() if task.startswith('reg') else y)
-            # --- 实证排错A：第一步，在 backward 之后打印一次 head 权重/梯度范数 ---
+                loss = criterion(logits, y_for_loss)
+            # 反传
             scaler.scale(loss).backward()
+            # --- 新增：梯度裁剪（AMP 路径需先 unscale） ---
+            if grad_clip and grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            # 首步调试输出
             if i_SNW == 0:
                 with torch.no_grad():
                     for n, p in model.named_parameters():
@@ -272,9 +327,13 @@ def train_one_epoch(model, loader, optimizer, device, criterion, task, num_class
             scaler.update()
         else:
             logits = model(x5, x3)
-            loss = criterion(logits, y.float() if task.startswith('reg') else y)
-            # --- 实证排错A：第一步，在 backward 之后打印一次 head 权重/梯度范数 ---
+            loss = criterion(logits, y_for_loss)
+            # 反传
             loss.backward()
+            # --- 新增：梯度裁剪 ---
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            # 首步调试输出
             if i_SNW == 0:
                 with torch.no_grad():
                     for n, p in model.named_parameters():
@@ -284,28 +343,25 @@ def train_one_epoch(model, loader, optimizer, device, criterion, task, num_class
                             break
             optimizer.step()
 
-
         loss_meter.update(loss.item(), y.size(0))
         if task.startswith('reg'):
-            # accumulate for RMSE if desired (we keep it simple: compute on-the-fly average MSE via loss_meter)
+            # 累计 RMSE 使用 loss_meter.avg 近似（训练阶段）
             pass
         else:
             pred = torch.argmax(logits, dim=-1)
             correct += (pred==y).sum().item()
             total += y.size(0)
 
-        # --- 先记录 step_done，再打印日志（保持 3.2 调整） ---
+        # --- 先记录 step_done，再打印日志 ---
         step_done = time.time()
-
         i_SNW += 1
         if i_SNW % 200 == 0:
             print(f"[train] step={i_SNW} data_time={data_ready-t0:.3f}s "
                   f"step_time={step_done-data_ready:.3f}s loss={loss.item():.4f}")
-
         t0 = time.time()
 
     if task.startswith('reg'):
-        # approximate RMSE from averaged loss (MSE); for exact compute, need accumulated preds
+        # approximate RMSE from averaged loss（Huber 与 MSE 不同，这里仅返回 loss 与近似 rmse）
         rmse = float(math.sqrt(max(loss_meter.avg, 0.0)))
         return {'loss': loss_meter.avg, 'rmse': rmse}
     else:
@@ -315,7 +371,9 @@ def train_one_epoch(model, loader, optimizer, device, criterion, task, num_class
 
 
 
-def evaluate(model, loader, device, criterion, task):
+def evaluate(model, loader, device, criterion, task,
+             y_mean: Optional[torch.Tensor]=None, y_std: Optional[torch.Tensor]=None,
+             standardize_targets: bool = False):
     model.eval()
     loss_meter = AverageMeter()
     if task.startswith('reg'):
@@ -329,12 +387,20 @@ def evaluate(model, loader, device, criterion, task):
             x3 = batch['utr3'].to(device, non_blocking=True)
             y  = batch['label'].to(device, non_blocking=True)
             logits = model(x5, x3)
-            loss = criterion(logits, y.float() if task.startswith('reg') else y)
-            loss_meter.update(loss.item(), y.size(0))
-            if task.startswith('reg'):
-                all_pred.append(logits.cpu())
+            if task.startswith('reg') and standardize_targets:
+                # 验证：将预测反标准化回原尺度，再用 MSE 评估（与补丁一致）
+                y_hat_eval = _maybe_destandardize_preds(logits, y_mean, y_std)
+                val_mse = torch.mean((y_hat_eval - y.float())**2).item()
+                loss_meter.update(val_mse, y.size(0))
+                all_pred.append(y_hat_eval.cpu())
                 all_y.append(y.float().cpu())
             else:
+                loss = criterion(logits, (y.float() if task.startswith('reg') else y))
+                loss_meter.update(loss.item(), y.size(0))
+                if task.startswith('reg'):
+                    all_pred.append(logits.cpu())
+                    all_y.append(y.float().cpu())
+            if not task.startswith('reg'):
                 pred = torch.argmax(logits, dim=-1)
                 correct += (pred==y).sum().item()
                 total += y.size(0)
@@ -343,12 +409,16 @@ def evaluate(model, loader, device, criterion, task):
     if task.startswith('reg'):
         y_true = torch.cat(all_y, dim=0).numpy() if all_y else np.zeros((0,54), dtype=np.float32)
         y_pred = torch.cat(all_pred, dim=0).numpy() if all_pred else np.zeros_like(y_true)
-        # macro RMSE across targets
-        mse = np.mean((y_pred - y_true)**2, axis=0)
-        rmse = float(np.sqrt(np.mean(mse)))
-        # R^2 macro
-        var = np.var(y_true, axis=0)
-        r2  = float(1.0 - np.mean(mse / (var + 1e-12)))
+        # macro RMSE & R^2（原尺度）
+        mse = np.mean((y_pred - y_true)**2, axis=0) if y_true.size else 0.0
+        if isinstance(mse, float):
+            rmse = float(np.sqrt(mse))
+            var = float(np.var(y_true)) if y_true.size else 0.0
+            r2  = float(1.0 - (mse / (var + 1e-12))) if y_true.size else 0.0
+        else:
+            rmse = float(np.sqrt(np.mean(mse)))
+            var = np.var(y_true, axis=0) if y_true.size else 0.0
+            r2  = float(1.0 - np.mean(mse / (var + 1e-12))) if y_true.size else 0.0
         return {'loss': loss_meter.avg, 'rmse': rmse, 'r2': r2, 'y_true': y_true, 'y_pred': y_pred}
     else:
         acc = correct/max(1,total)
@@ -359,21 +429,21 @@ def evaluate(model, loader, device, criterion, task):
 
 
 def run_training(cfg: Dict[str, Any]):
-    # --- 实证排错B：唯一启动标记（用于确认跑到的是这份代码） ---
-    print("[stamp] train_loop v2025-10-28c, sampler=PartGroupedSampler, shuffle=False")
+    # --- 修改：启动标记 ---
+    print("[stamp] train_loop v2025-11-04a, sampler=PartGroupedSampler, train.shuffle=cfg.train.shuffle")
 
     # 读取 debug 配置（保留：用于 train_one_epoch 的行为分支打印）
     dbg = cfg.get('debug', {})
     head_only_dbg = bool(dbg.get('head_only', False))
     _unused_head_lr = float(dbg.get('head_lr', 1e-2))  # 兼容旧配置，不再在此处生效
 
-    # --- 新增：读取训练日程 ---
+    # --- 日程 ---
     sched = cfg.get('schedule', {})
     warmup_epochs     = int(sched.get('warmup_epochs', int(cfg['train'].get('epochs', 3))))
     probe_head_epochs = int(sched.get('probe_head_epochs', 0))
     probe_head_lr     = float(sched.get('probe_head_lr', 1e-2))
 
-    # --- 新增：小样本过拟合自检开关 ---
+    # --- 小样本过拟合自检开关 ---
     limit_n = int(dbg.get('limit_train_samples', 0))  # 0 表示不用
 
     set_seed(int(cfg.get('seed', 20251003)))
@@ -385,6 +455,9 @@ def run_training(cfg: Dict[str, Any]):
     pin_memory = bool(cfg['train'].get('pin_memory', True))
     prefetch_factor = int(cfg['train'].get('prefetch_factor', 2)) if num_workers>0 else None
     persistent_workers = bool(cfg['train'].get('persistent_workers', True)) and num_workers>0
+    grad_clip = float(cfg['train'].get('grad_clip', 0.0))
+    standardize_targets = bool(cfg['train'].get('standardize_y', False))
+    use_shuffle = bool(cfg['train'].get('shuffle', False))  # 新增：允许 DataLoader.shuffle=True
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     cudnn.benchmark = True
@@ -410,7 +483,7 @@ def run_training(cfg: Dict[str, Any]):
     n_channels = infer_n_channels(train_ds[0])
     print(f"[Data] inferred input channels = {n_channels}")
 
-    # 训练集使用采样器：默认分片感知；当 limit_n>0 时改用 OverfitSubsetSampler
+    # 训练集：默认使用分片感知采样器；当 limit_n>0 时改用 OverfitSubsetSampler
     if limit_n > 0:
         print(f"[debug] OverfitSubsetSampler enabled: n={limit_n}")
         sampler = OverfitSubsetSampler(train_ds, n_samples=limit_n, seed=int(cfg.get('seed', 0)))
@@ -421,10 +494,10 @@ def run_training(cfg: Dict[str, Any]):
             seed=int(cfg.get('seed', 0))
         )
 
+    # === 新增：若 cfg.train.shuffle=True，则禁用 sampler，直接用 DataLoader(shuffle=True) ===
     train_loader_kwargs = dict(
         batch_size=bs,
         num_workers=num_workers,
-        sampler=sampler,
         pin_memory=pin_memory,
         worker_init_fn=_worker_init_fn
     )
@@ -432,6 +505,13 @@ def run_training(cfg: Dict[str, Any]):
         train_loader_kwargs['persistent_workers'] = True
     if prefetch_factor is not None:
         train_loader_kwargs['prefetch_factor'] = prefetch_factor
+
+    if use_shuffle:
+        train_loader_kwargs['shuffle'] = True
+        print("[Data] train_loader shuffle=True（禁用自定义 sampler）")
+    else:
+        train_loader_kwargs['sampler'] = sampler
+        train_loader_kwargs.setdefault('shuffle', False)
 
     # 验证集：保持顺序，不使用训练 sampler
     val_loader_kwargs = dict(
@@ -450,10 +530,21 @@ def run_training(cfg: Dict[str, Any]):
     val_loader   = DataLoader(val_ds, **val_loader_kwargs)
     print(f"[Data] DataLoader ready (num_workers={num_workers}, prefetch_factor={prefetch_factor}, pin_memory={pin_memory})")
 
+    # === 回归任务时可选：预计算 y 的 mean/std（按训练集） ===
+    y_mean: Optional[torch.Tensor] = None
+    y_std:  Optional[torch.Tensor] = None
+    if task.startswith('reg') and standardize_targets:
+        print("[Data] standardize_y=True：开始统计训练集 y 的均值/标准差 ...")
+        y_mean_cpu, y_std_cpu = _compute_target_stats(train_ds, batch_size=max(2048, bs))
+        print(f"[Data] y_mean shape={tuple(y_mean_cpu.shape)} y_std mean={float(y_std_cpu.mean()):.6f}")
+        # 放到 device 上，形状 (D,) 便于广播
+        y_mean = y_mean_cpu.to(device)
+        y_std  = y_std_cpu.to(device)
+
     model = build_model(n_channels, cfg)
     model.to(device)
 
-    # --- 构造优化器：改为“BN/bias 不做权重衰减”的参数分组 ---
+    # --- 构造优化器：AdamW + BN/Norm/bias 不做权重衰减 ---
     optim_cfg = cfg.get('optim', {'optimizer':'adamw','lr':1e-3,'weight_decay':1e-2})
     optimizer = build_optimizer_with_bn_exclusion(model, optim_cfg)
 
@@ -476,11 +567,15 @@ def run_training(cfg: Dict[str, Any]):
 
     # === 阶段A：端到端训练 warmup_epochs 轮 ===
     for ep in range(1, warmup_epochs+1):
-        if hasattr(train_loader.sampler, "set_epoch"):  # 你已有
+        # 分布式/自定义采样器需要 epoch 种子
+        if not use_shuffle and hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(ep)
         tr = train_one_epoch(model, train_loader, optimizer, device, criterion,
-                             task, num_classes, scaler, amp_enabled, head_only=False)
-        va = evaluate(model, val_loader, device, criterion, task)
+                             task, num_classes, scaler, amp_enabled, head_only=False,
+                             y_mean=y_mean, y_std=y_std, grad_clip=grad_clip,
+                             standardize_targets=standardize_targets)
+        va = evaluate(model, val_loader, device, criterion, task,
+                      y_mean=y_mean, y_std=y_std, standardize_targets=standardize_targets)
         if task.startswith('reg'):
             metric = va['rmse']
         else:
@@ -502,10 +597,12 @@ def run_training(cfg: Dict[str, Any]):
         # 只训 head 的优化器（保持原逻辑，不改动）
         optimizer = torch.optim.AdamW(model.head.parameters(), lr=probe_head_lr, weight_decay=0.0)
         for ep in range(1, probe_head_epochs+1):
-            # 注意：这里把 head_only=True 传给 train_one_epoch
             tr = train_one_epoch(model, train_loader, optimizer, device, criterion,
-                                 task, num_classes, scaler, amp_enabled, head_only=True)
-            va = evaluate(model, val_loader, device, criterion, task)
+                                 task, num_classes, scaler, amp_enabled, head_only=True,
+                                 y_mean=y_mean, y_std=y_std, grad_clip=grad_clip,
+                                 standardize_targets=False)
+            va = evaluate(model, val_loader, device, criterion, task,
+                          y_mean=y_mean, y_std=y_std, standardize_targets=False)
             print(f"[Probe {ep:02d}] train_loss={tr['loss']:.4f} train_acc={tr['acc']:.4f} "
                   f"val_loss={va['loss']:.4f} val_acc={va['acc']:.4f}")
 

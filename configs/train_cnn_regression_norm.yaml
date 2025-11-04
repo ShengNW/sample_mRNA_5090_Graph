@@ -1,4 +1,17 @@
 # configs/train_cnn_regression_norm.yaml
+model:
+  name: cnn_dual_branch
+  embedding:
+    mode: linear
+    dim: 8
+    share_between_utr5_utr3: false
+  trunk:
+    channels: [64, 128, 256]
+logging:
+  out_dir: outputs/cnn_v1_reg
+  checkpoint_dir: outputs/cnn_v1_reg/checkpoints
+  save_every_epochs: 0
+  csv_log: logs/cnn_v1_reg_training.csv
 task: regression
 data:
   dataset_dir: data/processed/seq_cnn_v1_reg
