@@ -1,0 +1,47 @@
+data:
+  # input_path: "F:/CODE/social/JianZhi/mRNA/Sample_mRNA_002_extractUTR/data_intermediate/train/train_pair.v1.parquet"#实际代码不支持
+  input_parquet: "data/rawData/train_pair.v1.parquet"
+  # 替换为你的实际路径；也可以用相对路径
+
+colmap:
+  organ: "organ_id"
+  utr5: "utr5_seq"
+  utr3: "utr3_seq"
+  split: "split"          # 若无此列，下面 use_existing=false
+  y_reg: null             # 纯分类先置空
+
+filters:
+  drop_if_missing_both_utrs: true
+  require_any_utr: true
+  max_n_frac: 0.10        # 单条序列中 N 比例阈值
+  deduplicate: true       # sample_id 级去重（同utr5+utr3+organ）
+
+encoding:
+  alphabet: "ACGTN"
+  uppercase: true
+  map_u_to_t: true
+  unknown_to: "N"
+  mode: "onehot"          # onehot | index
+
+truncation:
+  utr5:
+    max_len: 1024
+    strategy: "tail"      # 保留靠近起始密码子的端（推荐）
+  utr3:
+    max_len: 2048
+    strategy: "ends_concat"
+    head_len: 1024
+    tail_len: 1024
+
+splits:
+  use_existing: true      # 你的数据已带 split 就用这个
+  ratios: {train: 0.8, val: 0.1, test: 0.1}
+  stratify_by: "organ_id"
+  seed: 20251003
+
+output:
+  dir: "data/processed/seq_cnn_v1"
+  shard_size: 50000
+  format: "pt"           # npz | pt
+  write_index_tables: true
+  save_fasta_preview: false

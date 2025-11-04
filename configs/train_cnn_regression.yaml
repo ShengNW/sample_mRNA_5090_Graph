@@ -1,0 +1,50 @@
+# --- train_cnn_mtl_regression.yaml ---
+seed: 20251028
+
+task: regression  # multi-target regression over tissues
+
+data:
+  dataset_dir: data/processed/seq_cnn_v1_reg #data/processed/seq_cnn_v1   # 与分类相同的数据根；需要将 labels 替换为 shape=(N,54) 的连续值
+  input_shapes:
+    utr5: 1024
+    utr3: 2048
+  encoding: onehot
+  num_targets: 54   # 注意：是 54 不是 55
+
+model:
+  name: cnn_dual_branch
+  embedding:
+    mode: linear
+    dim: 8
+    share_between_utr5_utr3: false
+  trunk:
+    channels: [64, 128, 256]
+
+train:
+  epochs: 20
+  batch_size: 128
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  amp: true
+  block_shuffle: 4096
+
+optim:
+  optimizer: adamw
+  lr: 0.001
+  weight_decay: 0.01
+
+schedule:
+  warmup_epochs: 20
+  probe_head_epochs: 0
+
+logging:
+  out_dir: outputs/cnn_v1_reg
+  checkpoint_dir: outputs/cnn_v1_reg/checkpoints
+  save_every_epochs: 0
+  csv_log: logs/cnn_v1_reg_training.csv
+
+debug:
+  head_only: false
+  limit_train_samples: 0

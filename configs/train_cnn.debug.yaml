@@ -1,0 +1,98 @@
+# ==============================
+# train_cnn.debug.yaml (updated)
+# ==============================
+
+seed: 20251028            # [MOD.seed] 与示例一致，增加全局 seed（保守起见，train.seed 也同步）
+
+data:
+  dataset_dir: data/processed/seq_cnn_v1
+  mapping_path: data/processed/seq_cnn_v1/label_mapping.json
+  input_shapes:
+    utr5: 1024
+    utr3: 2048
+  encoding: onehot
+  num_classes: 54
+
+model:
+  name: cnn_dual_branch
+  embedding:
+    mode: linear
+    dim: 8
+    share_between_utr5_utr3: false
+  trunk:
+    channels:
+    - 64
+    - 128
+    - 256
+    kernel_sizes:
+    - 7
+    - 5
+    - 3
+    depthwise_separable: true
+    blocks_per_stage: 2
+    activation: gelu
+    norm: batchnorm #layernorm
+    dropout: 0 #0.2
+    pooling: gap
+  head:
+    hidden: 256
+    dropout: 0.3
+    num_classes: 54
+
+loss:
+  type: cross_entropy
+  label_smoothing: 0.0 #0.05
+  class_weights: auto
+
+optim:
+  optimizer: adamw
+  lr: 6.0e-3 #1.0e-2 #3.0e-3         #1e-3 #3e-4
+  weight_decay: 0.0  # 过拟合小集先关正则 1.0e-4 #weight_decay: 1.0e-2   # [MOD.opt_wd] 与示例一致（之前是 1e-4）
+  scheduler: cosine
+  warmup_steps: 0
+
+# -------------------------------
+# 两阶段训练日程（新增）
+# -------------------------------
+schedule:                 # [MOD.schedule] 新增：阶段A/B配置
+  warmup_epochs: 100 #30 #3        # 阶段A：端到端 3 轮
+  probe_head_epochs: 1 #1    # 阶段B：head-only 探针 1 轮
+  probe_head_lr: 0.01
+
+train:
+  epochs: 100 #30 #3               # [MOD.epochs] 与示例一致：warmup 轮数=3（被 schedule 覆盖也无妨）
+  early_stopping_patience: 1 #0
+  batch_size: 256    # 可适当减小，增大梯度噪声 512 #256 #64 #8 #128 #64
+  num_workers: 20 #8 #4 #12 #0
+  amp: false #true
+  grad_clip_norm: 1.0
+  seed: 20251028          # [MOD.seed] 同步 train.seed，确保无论读取哪个字段都一致
+  pin_memory: true #false
+  persistent_workers: true #false
+  prefetch_factor: 8 #4 #2
+  block_shuffle: 4096     # [MOD.block_shuffle] 恢复/加入分片级打乱，配合性能
+
+logging:
+  out_dir: runs/cnn_v1
+  checkpoint_dir: checkpoints/cnn_v1
+  save_best_metric: macro_f1
+  save_every_epochs: 1
+  csv_log: logs/cnn_v1_training.csv
+
+eval:
+  run_on:
+  - val
+  - test
+  metrics:
+  - accuracy
+  - macro_f1
+  - macro_auroc
+  - macro_auprc
+  - ece
+  per_class: true
+  save_confusion_matrix: true
+
+debug:
+  head_only: false        # [MOD.debug] 关键：确保不开 head-only 起跑
+  head_lr: 0.01           # 保留原先的调试学习率
+  limit_train_samples: 2048

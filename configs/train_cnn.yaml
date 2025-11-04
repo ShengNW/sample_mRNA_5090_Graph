@@ -1,0 +1,72 @@
+data:
+  dataset_dir: data/processed/seq_cnn_v1
+  mapping_path: data/processed/seq_cnn_v1/label_mapping.json
+  input_shapes:
+    utr5: 1024
+    utr3: 2048
+  encoding: onehot
+  num_classes: 54
+model:
+  name: cnn_dual_branch
+  embedding:
+    mode: linear
+    dim: 8
+    share_between_utr5_utr3: false
+  trunk:
+    channels:
+    - 64
+    - 128
+    - 256
+    kernel_sizes:
+    - 7
+    - 5
+    - 3
+    depthwise_separable: true
+    blocks_per_stage: 2
+    activation: gelu
+    norm: layernorm
+    dropout: 0.2
+    pooling: gap
+  head:
+    hidden: 256
+    dropout: 0.3
+    num_classes: 54
+loss:
+  type: cross_entropy
+  label_smoothing: 0.05
+  class_weights: auto
+optim:
+  optimizer: adamw
+  lr: 3e-4
+  weight_decay: 1e-4
+  scheduler: cosine
+  warmup_steps: 0
+train:
+  epochs: 50
+  early_stopping_patience: 10
+  batch_size: 128 #64
+  num_workers: 12 #0
+  amp: true
+  grad_clip_norm: 1.0
+  seed: 20251003
+  pin_memory: true #false
+  persistent_workers: true #false
+  prefetch_factor: 4 #2
+logging:
+  out_dir: runs/cnn_v1
+  checkpoint_dir: checkpoints/cnn_v1
+  save_best_metric: macro_f1
+  save_every_epochs: 0
+  csv_log: logs/cnn_v1_training.csv
+eval:
+  run_on:
+  - val
+  - test
+  metrics:
+  - accuracy
+  - macro_f1
+  - macro_auroc
+  - macro_auprc
+  - ece
+  per_class: true
+  save_confusion_matrix: true

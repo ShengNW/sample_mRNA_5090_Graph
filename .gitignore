@@ -1,0 +1,68 @@
+# ===== 通用（Python/系统） =====
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# 虚拟环境 / 本地配置
+.venv/
+venv/
+.env
+.env.*
+
+# ===== 项目产物 / 大文件 =====
+# 模型检查点
+checkpoints/
+checkpoint/
+*.pt
+*.ckpt
+
+# 训练输出与日志
+outputs/
+runs/
+*.log
+
+# 数据（原始与处理后）
+data/
+*.parquet
+*.npz
+*.npy
+*.pkl
+*.pickle
+
+# 旧版/废弃分支（文件 & 目录）
+*_old_*
+*_old.*/
+*_old*/
+*_old
+
+# 其他临时文件
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# （可选）大图/归档文件——若需纳入版本控制，删掉下面几行
+# *.png
+# *.jpg
+# *.tar
+# *.tar.gz
+# *.zip
+# *.gz
+# *.xz
+# *.zst
+
+# 按你的要求忽略 __init__（注意：这样会导致包不可被 import）
+__init__.py
+__init__.*
+
+# 旧版文件（含 `_old.`）
+*_old.*
+**/*_old.*
+# === generated artifacts ===
+# 忽略任何名字里包含 "_new" 的文件/目录（例如 reports_new_000_100/）
+*_new*/
+*_new*
+reports_unKnow/
+reports_unknow/
