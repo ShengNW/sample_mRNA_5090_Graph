@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import logging
 import math
 import os
 from collections import defaultdict
@@ -43,6 +44,39 @@ import torch
 import yaml
 
 from src.side.features import load_utr_coords
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def configure_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> None:
+    """Configure root logging handlers for console and optional file output."""
+
+    level = getattr(logging, (log_level or "INFO").upper(), logging.INFO)
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    root.setLevel(level)
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    console = logging.StreamHandler()
+    console.setLevel(level)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    if log_file:
+        log_path = Path(log_file).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+
+    logging.captureWarnings(True)
 
 
 def _resolve_path_case_insensitive(path: Path) -> Path:
@@ -175,6 +209,13 @@ def _select_ends_concat(
 def build_truncation_map(
     utr_coords: Mapping[str, Mapping[str, object]], trunc_cfg: TruncationConfig
 ) -> Dict[str, UTRTruncationMap]:
+    LOGGER.info(
+        "Building truncation map for %d genes using config: utr5=%d, utr3_head=%d, utr3_tail=%d",
+        len(utr_coords),
+        trunc_cfg.utr5_len,
+        trunc_cfg.utr3_head,
+        trunc_cfg.utr3_tail,
+    )
     maps: Dict[str, UTRTruncationMap] = {}
     for gene_id, info in utr_coords.items():
         chrom = info.get("chr")
@@ -200,6 +241,14 @@ def build_truncation_map(
             min_start=info.get("min_start"),
             max_end=info.get("max_end"),
         )
+    utr5_count = sum(1 for info in maps.values() if info.utr5_positions)
+    utr3_count = sum(1 for info in maps.values() if info.utr3_positions)
+    LOGGER.info(
+        "Constructed truncation map for %d genes (%d with 5' UTR, %d with 3' UTR)",
+        len(maps),
+        utr5_count,
+        utr3_count,
+    )
     return maps
 
 
@@ -227,6 +276,7 @@ def build_rbp_masks(
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     """Return binary masks (per base) for RBP overlaps on 5' and 3' UTRs."""
 
+    LOGGER.info("Building RBP masks from peak directory %s", peaks_dir)
     mask5: Dict[str, np.ndarray] = {
         gene: np.zeros(len(info.utr5_positions), dtype=np.float32)
         for gene, info in trunc_map.items()
@@ -244,7 +294,11 @@ def build_rbp_masks(
     for chrom in genes_by_chr:
         genes_by_chr[chrom].sort(key=lambda x: x[0])
 
+    num_files = 0
+    num_peaks = 0
     for path in _iter_rbp_peak_files(peaks_dir):
+        num_files += 1
+        LOGGER.debug("Processing RBP peak file %s", path)
         with _open_text(path) as handle:
             for line in handle:
                 if not line or line.startswith("#"):
@@ -252,6 +306,7 @@ def build_rbp_masks(
                 cols = line.strip().split()
                 if len(cols) < 3:
                     continue
+                num_peaks += 1
                 chrom = cols[0]
                 try:
                     start = int(cols[1])
@@ -279,12 +334,16 @@ def build_rbp_masks(
                         idx3 = info.utr3_index.get(pos)
                         if idx3 is not None and idx3 < mask3[gene_id].size:
                             mask3[gene_id][idx3] = 1.0
+    LOGGER.info(
+        "Finished building RBP masks from %d files with %d peaks", num_files, num_peaks
+    )
     return mask5, mask3
 
 
 def build_trna_features(
     trna_bed: Path, trunc_map: Mapping[str, UTRTruncationMap]
 ) -> Dict[str, float]:
+    LOGGER.info("Computing tRNA distances from %s", trna_bed)
     trna_bed = _resolve_path_case_insensitive(trna_bed)
     positions: Dict[str, List[int]] = defaultdict(list)
     with open(trna_bed, "r") as fh:
@@ -324,6 +383,7 @@ def build_trna_features(
         return min(dist_candidates) if dist_candidates else None
 
     trna_dist: Dict[str, float] = {}
+    num_assigned = 0
     for gene, info in trunc_map.items():
         if not info.utr5_positions and not info.utr3_positions:
             continue
@@ -341,6 +401,8 @@ def build_trna_features(
             continue
         dist = nearest_distance(chrom, reference_pos)
         trna_dist[gene] = float(dist) if dist is not None else float("inf")
+        num_assigned += 1
+    LOGGER.info("Computed tRNA distances for %d genes", num_assigned)
     return trna_dist
 
 
@@ -453,6 +515,7 @@ def _normalise_trna_distance(dist: float, cap: float) -> float:
 def _write_split_indices(meta: pd.DataFrame, output_dir: Path) -> None:
     index_root = output_dir / "index"
     index_root.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Writing split indices under %s", index_root)
     for split, df_split in meta.groupby("split"):
         split_dir = index_root / split
         split_dir.mkdir(parents=True, exist_ok=True)
@@ -460,9 +523,15 @@ def _write_split_indices(meta: pd.DataFrame, output_dir: Path) -> None:
         parquet_path = split_dir / "index.parquet"
         try:
             table.to_parquet(parquet_path, index=False)
+            LOGGER.debug("Wrote parquet index for split '%s' to %s", split, parquet_path)
         except Exception:
             csv_path = split_dir / "index.csv"
             table.to_csv(csv_path, index=False)
+            LOGGER.warning(
+                "Failed to write parquet for split '%s'; fell back to CSV at %s",
+                split,
+                csv_path,
+            )
 
 
 def _write_manifest(
@@ -491,6 +560,7 @@ def _write_manifest(
     manifest_path = output_dir / "manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
+    LOGGER.info("Wrote manifest metadata to %s", manifest_path)
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +569,9 @@ def _write_manifest(
 
 
 def run(args: argparse.Namespace) -> None:
+    if not logging.getLogger().handlers:
+        configure_logging()
+    LOGGER.info("Loading dataset configuration from %s", args.dataset_config)
     with open(args.dataset_config, "r", encoding="utf-8") as fh:
         dataset_cfg = yaml.safe_load(fh)
 
@@ -507,12 +580,20 @@ def run(args: argparse.Namespace) -> None:
         utr3_head=int(dataset_cfg["truncation"]["utr3"]["head_len"]),
         utr3_tail=int(dataset_cfg["truncation"]["utr3"]["tail_len"]),
     )
+    LOGGER.info(
+        "Truncation config resolved to utr5=%d, utr3_head=%d, utr3_tail=%d",
+        trunc_cfg.utr5_len,
+        trunc_cfg.utr3_head,
+        trunc_cfg.utr3_tail,
+    )
 
     input_path = Path(dataset_cfg["data"]["input_parquet"])
     if not input_path.exists():
         raise FileNotFoundError(f"Input parquet not found: {input_path}")
 
+    LOGGER.info("Loading base dataset from %s", input_path)
     df = pd.read_parquet(input_path)
+    LOGGER.info("Loaded %d rows with %d columns", len(df), len(df.columns))
     gene_col = args.gene_col or "gene_id"
     if gene_col not in df.columns:
         raise KeyError(f"Column '{gene_col}' not found in input data")
@@ -564,19 +645,23 @@ def run(args: argparse.Namespace) -> None:
     organ_codes = df["organ_id"].astype("category")
     df["organ_index"] = organ_codes.cat.codes.astype(np.int64)
     organ_vocab = {int(code): str(cat) for code, cat in enumerate(organ_codes.cat.categories)}
+    LOGGER.info("Detected %d unique organs", len(organ_vocab))
 
     utr_coords = load_utr_coords(args.gtf)
+    LOGGER.info("Loaded UTR coordinates for %d genes from %s", len(utr_coords), args.gtf)
     trunc_map = build_truncation_map(utr_coords, trunc_cfg)
 
     rbp_mask5, rbp_mask3 = build_rbp_masks(Path(args.rbp_dir), trunc_map)
     trna_dist = build_trna_features(Path(args.trna_bed), trunc_map)
 
     N = len(df)
+    LOGGER.info("Preparing feature tensors for %d samples", N)
     x5 = np.zeros((N, 7, trunc_cfg.utr5_len), dtype=np.float32)
     x3 = np.zeros((N, 7, trunc_cfg.utr3_len), dtype=np.float32)
     organ_arr = df["organ_index"].to_numpy(dtype=np.int64)
     target_arr = df["target"].to_numpy(dtype=np.float32)
 
+    progress_interval = max(1, N // 20)
     for i, row in df.iterrows():
         gene_id = row["gene_id"]
         seq5 = row["utr5_seq"]
@@ -608,10 +693,13 @@ def run(args: argparse.Namespace) -> None:
         trna3 = _prepare_trna_channel(norm_val, trunc_cfg.utr3_len)
         x5[i] = np.vstack([onehot5, mask5.reshape(1, -1), trna5.reshape(1, -1)])
         x3[i] = np.vstack([onehot3, mask3.reshape(1, -1), trna3.reshape(1, -1)])
+        if (i + 1) % progress_interval == 0 or i + 1 == N:
+            LOGGER.debug("Encoded %d/%d samples", i + 1, N)
 
     output_dir = Path(args.output_dir)
     shards_dir = output_dir / "shards"
     shards_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Writing dataset shards to %s", shards_dir)
 
     shard_size = args.shard_size
     shard_meta: List[Tuple[str, int]] = []
@@ -627,6 +715,7 @@ def run(args: argparse.Namespace) -> None:
         }
         shard_path = shards_dir / f"data.part-{part_id:05d}.pt"
         torch.save(payload, shard_path)
+        LOGGER.info("Wrote shard %s with %d samples", shard_path, end - start)
         shard_meta.append((str(shard_path), end - start))
         for local_idx, global_idx in enumerate(range(start, end)):
             meta_rows.append(
@@ -649,7 +738,14 @@ def run(args: argparse.Namespace) -> None:
         "test": int((df["split"].astype(str) == "test").sum()),
     }
     _write_manifest(output_dir, trunc_cfg, counts, shard_meta, organ_vocab)
-    print(f"Wrote dataset with {N} samples to {output_dir}")
+    LOGGER.info(
+        "Dataset build complete with %d total samples (train=%d, val=%d, test=%d)",
+        counts["total"],
+        counts["train"],
+        counts["val"],
+        counts["test"],
+    )
+    LOGGER.info("Manifest and metadata written to %s", output_dir)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -667,12 +763,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--split-col", default=None, help="Column name for dataset split")
     parser.add_argument("--shard-size", type=int, default=50000, help="Number of samples per output shard")
     parser.add_argument("--trna-cap", type=float, default=100_000.0, help="Maximum distance for tRNA normalisation")
+    parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING, ...)")
+    parser.add_argument("--log-file", default=None, help="Optional path to write detailed logs")
     return parser
 
 
 def main() -> None:
     parser = build_argparser()
     args = parser.parse_args()
+    configure_logging(args.log_level, args.log_file)
     run(args)
 
 
