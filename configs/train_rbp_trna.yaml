@@ -21,3 +21,16 @@ hidden_dim: 256
 dropout: 0.2
 
 output_model_path: outputs/cnn_film_rbp_trna_best.pt
+
+# Validation-specific dataloader overrides. These keep the training loader fast
+# while trimming memory usage for the val split to avoid OOM. If the validation
+# loader still runs out of memory, progressively lower `batch_size` (e.g. 16,
+# 8) and, if needed, set `num_workers` to 0 so that batches are loaded on the
+# main process.
+split_loader_overrides:
+  val:
+    batch_size: 32
+    num_workers: 1
+    max_cache_shards: 1
+    prefetch_factor: 1
+    persistent_workers: false

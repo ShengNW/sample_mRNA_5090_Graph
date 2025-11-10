@@ -52,14 +52,18 @@ def create_dataloaders(
     shard_seed: int,
     persistent_workers: bool,
     prefetch_factor: int,
+    split_overrides: Dict[str, Dict] | None = None,
 ) -> Dict[str, DataLoader]:
     loaders: Dict[str, DataLoader] = {}
+    split_overrides = split_overrides or {}
     for split in ("train", "val"):
+        split_cfg = split_overrides.get(split, {})
+        split_max_cache_shards = split_cfg.get("max_cache_shards", max_cache_shards)
         try:
             dataset = UTRFeatureShardDataset(
                 dataset_dir,
                 split=split,
-                max_cache_shards=max_cache_shards,
+                max_cache_shards=split_max_cache_shards,
             )
         except FileNotFoundError:
             if split == "val":
@@ -78,17 +82,21 @@ def create_dataloaders(
                 dataset.shard_groups,
                 seed=shard_seed,
             )
+        split_batch_size = split_cfg.get("batch_size", batch_size)
+        split_num_workers = split_cfg.get("num_workers", num_workers)
         loader_kwargs = dict(
             dataset=dataset,
-            batch_size=batch_size,
+            batch_size=split_batch_size,
             shuffle=(sampler is None and split == "train"),
-            num_workers=num_workers,
+            num_workers=split_num_workers,
             pin_memory=True,
             sampler=sampler,
         )
-        if num_workers > 0:
-            loader_kwargs["persistent_workers"] = persistent_workers
-            loader_kwargs["prefetch_factor"] = prefetch_factor
+        if split_num_workers > 0:
+            loader_kwargs["persistent_workers"] = split_cfg.get(
+                "persistent_workers", persistent_workers
+            )
+            loader_kwargs["prefetch_factor"] = split_cfg.get("prefetch_factor", prefetch_factor)
         loaders[split] = DataLoader(**loader_kwargs)
         if rank == 0:
             num_batches = len(loaders[split])
@@ -97,8 +105,8 @@ def create_dataloaders(
                 split,
                 len(dataset),
                 num_batches,
-                batch_size,
-                num_workers,
+                split_batch_size,
+                split_num_workers,
             )
     return loaders
 
@@ -146,6 +154,7 @@ def run_training(cfg: Dict) -> None:
         shard_seed=cfg.get("dataloader_seed", 0),
         persistent_workers=cfg.get("persistent_workers", True),
         prefetch_factor=cfg.get("prefetch_factor", 2),
+        split_overrides=cfg.get("split_loader_overrides"),
     )
     if "train" not in loaders:
         raise RuntimeError("Training split not found in dataset")
