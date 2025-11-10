@@ -656,45 +656,7 @@ def run(args: argparse.Namespace) -> None:
 
     N = len(df)
     LOGGER.info("Preparing feature tensors for %d samples", N)
-    x5 = np.zeros((N, 7, trunc_cfg.utr5_len), dtype=np.float32)
-    x3 = np.zeros((N, 7, trunc_cfg.utr3_len), dtype=np.float32)
-    organ_arr = df["organ_index"].to_numpy(dtype=np.int64)
-    target_arr = df["target"].to_numpy(dtype=np.float32)
-
     progress_interval = max(1, N // 20)
-    for i, row in df.iterrows():
-        gene_id = row["gene_id"]
-        seq5 = row["utr5_seq"]
-        seq3 = row["utr3_seq"]
-        trunc_info = trunc_map.get(gene_id)
-        onehot5 = _one_hot_encode(seq5, trunc_cfg.utr5_len, "tail")
-        onehot3 = _one_hot_encode(
-            seq3,
-            trunc_cfg.utr3_len,
-            "ends",
-            head_len=trunc_cfg.utr3_head,
-            tail_len=trunc_cfg.utr3_tail,
-        )
-        mask5 = _prepare_rbp_channel(
-            rbp_mask5.get(gene_id),
-            trunc_cfg.utr5_len,
-            align="tail",
-        )
-        info3 = trunc_info.utr3_head_used if trunc_info else None
-        mask3 = _prepare_rbp_channel(
-            rbp_mask3.get(gene_id),
-            trunc_cfg.utr3_len,
-            align="ends",
-            head_len=info3,
-        )
-        dist = trna_dist.get(gene_id, float("inf"))
-        norm_val = _normalise_trna_distance(dist, args.trna_cap)
-        trna5 = _prepare_trna_channel(norm_val, trunc_cfg.utr5_len)
-        trna3 = _prepare_trna_channel(norm_val, trunc_cfg.utr3_len)
-        x5[i] = np.vstack([onehot5, mask5.reshape(1, -1), trna5.reshape(1, -1)])
-        x3[i] = np.vstack([onehot3, mask3.reshape(1, -1), trna3.reshape(1, -1)])
-        if (i + 1) % progress_interval == 0 or i + 1 == N:
-            LOGGER.debug("Encoded %d/%d samples", i + 1, N)
 
     output_dir = Path(args.output_dir)
     shards_dir = output_dir / "shards"
@@ -703,32 +665,97 @@ def run(args: argparse.Namespace) -> None:
 
     shard_size = args.shard_size
     shard_meta: List[Tuple[str, int]] = []
-    meta_rows: List[Dict[str, object]] = []
-    for part_id in range(int(math.ceil(N / shard_size))):
+    meta_global_idx: List[int] = []
+    meta_part_id: List[int] = []
+    meta_local_idx: List[int] = []
+    meta_organ_id: List[int] = []
+    meta_split: List[object] = []
+
+    processed = 0
+    num_shards = int(math.ceil(N / shard_size)) if shard_size > 0 else 0
+    for part_id in range(num_shards):
         start = part_id * shard_size
         end = min((part_id + 1) * shard_size, N)
+        chunk_df = df.iloc[start:end]
+        chunk_size = len(chunk_df)
+        if chunk_size == 0:
+            continue
+
+        chunk_x5 = np.zeros((chunk_size, 7, trunc_cfg.utr5_len), dtype=np.float32)
+        chunk_x3 = np.zeros((chunk_size, 7, trunc_cfg.utr3_len), dtype=np.float32)
+        organ_chunk = chunk_df["organ_index"].to_numpy(dtype=np.int64)
+        target_chunk = chunk_df["target"].to_numpy(dtype=np.float32)
+
+        for local_idx, row in enumerate(chunk_df.itertuples(index=False)):
+            gene_id = getattr(row, "gene_id")
+            seq5 = getattr(row, "utr5_seq")
+            seq3 = getattr(row, "utr3_seq")
+            split_val = getattr(row, "split")
+
+            trunc_info = trunc_map.get(gene_id)
+            onehot5 = _one_hot_encode(seq5, trunc_cfg.utr5_len, "tail")
+            onehot3 = _one_hot_encode(
+                seq3,
+                trunc_cfg.utr3_len,
+                "ends",
+                head_len=trunc_cfg.utr3_head,
+                tail_len=trunc_cfg.utr3_tail,
+            )
+            mask5 = _prepare_rbp_channel(
+                rbp_mask5.get(gene_id),
+                trunc_cfg.utr5_len,
+                align="tail",
+            )
+            info3 = trunc_info.utr3_head_used if trunc_info else None
+            mask3 = _prepare_rbp_channel(
+                rbp_mask3.get(gene_id),
+                trunc_cfg.utr3_len,
+                align="ends",
+                head_len=info3,
+            )
+            dist = trna_dist.get(gene_id, float("inf"))
+            norm_val = _normalise_trna_distance(dist, args.trna_cap)
+            trna5 = _prepare_trna_channel(norm_val, trunc_cfg.utr5_len)
+            trna3 = _prepare_trna_channel(norm_val, trunc_cfg.utr3_len)
+
+            chunk_x5[local_idx] = np.vstack(
+                [onehot5, mask5.reshape(1, -1), trna5.reshape(1, -1)]
+            )
+            chunk_x3[local_idx] = np.vstack(
+                [onehot3, mask3.reshape(1, -1), trna3.reshape(1, -1)]
+            )
+
+            global_idx = start + local_idx
+            meta_global_idx.append(global_idx)
+            meta_part_id.append(part_id)
+            meta_local_idx.append(local_idx)
+            meta_organ_id.append(int(organ_chunk[local_idx]))
+            meta_split.append(split_val)
+
+            processed += 1
+            if processed % progress_interval == 0 or processed == N:
+                LOGGER.debug("Encoded %d/%d samples", processed, N)
+
         payload = {
-            "utr5": torch.from_numpy(x5[start:end]),
-            "utr3": torch.from_numpy(x3[start:end]),
-            "organ_id": torch.from_numpy(organ_arr[start:end]),
-            "label": torch.from_numpy(target_arr[start:end]),
+            "utr5": torch.from_numpy(chunk_x5),
+            "utr3": torch.from_numpy(chunk_x3),
+            "organ_id": torch.from_numpy(organ_chunk),
+            "label": torch.from_numpy(target_chunk),
         }
         shard_path = shards_dir / f"data.part-{part_id:05d}.pt"
         torch.save(payload, shard_path)
-        LOGGER.info("Wrote shard %s with %d samples", shard_path, end - start)
-        shard_meta.append((str(shard_path), end - start))
-        for local_idx, global_idx in enumerate(range(start, end)):
-            meta_rows.append(
-                {
-                    "global_idx": global_idx,
-                    "part_id": part_id,
-                    "local_idx": local_idx,
-                    "organ_id": int(organ_arr[global_idx]),
-                    "split": df.iloc[global_idx]["split"],
-                }
-            )
+        LOGGER.info("Wrote shard %s with %d samples", shard_path, chunk_size)
+        shard_meta.append((str(shard_path), chunk_size))
 
-    meta_df = pd.DataFrame(meta_rows)
+    meta_df = pd.DataFrame(
+        {
+            "global_idx": meta_global_idx,
+            "part_id": meta_part_id,
+            "local_idx": meta_local_idx,
+            "organ_id": meta_organ_id,
+            "split": meta_split,
+        }
+    )
     _write_split_indices(meta_df, output_dir)
 
     counts = {
