@@ -4,6 +4,12 @@ dataset_dir: data/processed/seq_cnn_v1_rbp_trna
 
 batch_size: 64
 num_workers: 8
+max_cache_shards: 2  # limit shard residency to control RAM usage per worker
+log_interval: 200
+dataloader_seed: 0
+prefetch_factor: 2
+persistent_workers: true
+log_level: INFO
 epochs: 20
 learning_rate: 1.5e-3
 weight_decay: 1.0e-4
