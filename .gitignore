@@ -17,7 +17,7 @@ checkpoints/
 checkpoint/
 *.pt
 *.ckpt
-
+!Phase1output/cnn_film_rbp_trna_best.pt
 # 训练输出与日志
 outputs/
 runs/
