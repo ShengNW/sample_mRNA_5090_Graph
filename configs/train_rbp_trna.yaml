@@ -10,6 +10,7 @@ dataloader_seed: 0
 prefetch_factor: 2
 persistent_workers: true
 log_level: INFO
+log_file: /tmp/side_train_rbp_trna.log
 epochs: 20
 learning_rate: 1.5e-3
 weight_decay: 1.0e-4

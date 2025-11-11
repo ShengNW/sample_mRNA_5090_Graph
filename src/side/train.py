@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -38,6 +38,25 @@ def setup_device() -> Tuple[torch.device, bool, int, int, int]:
 
 
 logger = logging.getLogger(__name__)
+
+
+def add_file_logging(log_file: str) -> Path:
+    """Attach a file handler to the root logger and return the log path."""
+
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler_path = Path(getattr(handler, "baseFilename", ""))
+            if handler_path == log_path:
+                return log_path
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    root_logger.addHandler(file_handler)
+    return log_path
 
 
 def create_dataloaders(
@@ -112,14 +131,32 @@ def create_dataloaders(
 
 
 def compute_r2(preds: np.ndarray, targets: np.ndarray) -> float:
+    """Compute macro-averaged R^2 (mean over target dimensions).
+
+    This matches the evaluation used in the original ``cnn_v1`` pipeline by
+    averaging per-dimension R^2 scores. The function gracefully handles
+    single-target regression by viewing it as a single column.
+    """
+
     if preds.size == 0:
         return float("nan")
-    ss_res = np.sum((preds - targets) ** 2)
-    mean_y = np.mean(targets)
-    ss_tot = np.sum((targets - mean_y) ** 2)
-    if ss_tot == 0:
-        return float("nan")
-    return 1.0 - ss_res / ss_tot
+
+    preds = np.asarray(preds)
+    targets = np.asarray(targets)
+    if preds.shape != targets.shape:
+        raise ValueError(
+            "Predictions and targets must share the same shape for R^2 computation"
+        )
+
+    # Reshape to (num_samples, num_targets) so we can average over targets.
+    num_samples = preds.shape[0]
+    preds_flat = preds.reshape(num_samples, -1)
+    targets_flat = targets.reshape(num_samples, -1)
+
+    mse = np.mean((preds_flat - targets_flat) ** 2, axis=0)
+    var = np.var(targets_flat, axis=0)
+    r2_per_dim = 1.0 - mse / (var + 1e-12)
+    return float(np.mean(r2_per_dim))
 
 
 def run_training(cfg: Dict) -> None:
@@ -285,6 +322,14 @@ def main() -> None:
     log_level = cfg.get("log_level")
     if log_level:
         logging.getLogger().setLevel(getattr(logging, str(log_level).upper(), logging.INFO))
+    log_file: Optional[str] = cfg.get("log_file")
+    if log_file is None:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        log_file = f"/tmp/side_train_{timestamp}.log"
+    rank_env = int(os.environ.get("RANK", "0"))
+    if log_file and rank_env == 0:
+        log_path = add_file_logging(log_file)
+        logger.info("File logging enabled at %s", log_path)
     logger.info("Loaded training configuration from %s", args.config)
     run_training(cfg)
 
