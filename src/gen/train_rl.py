@@ -122,7 +122,16 @@ def main() -> None:
     L = L5 + L3
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    policy = Policy(L5, L3, hidden=512, num_organs=128).to(device)
+    model_cfg = cfg.get("model", {})
+    policy = Policy(
+        L5,
+        L3,
+        hidden=int(model_cfg.get("hidden", 512)),
+        num_organs=int(model_cfg.get("num_organs", 128)),
+        num_layers=int(model_cfg.get("layers", 6)),
+        num_heads=int(model_cfg.get("heads", 8)),
+        dropout=float(model_cfg.get("dropout", 0.0)),
+    ).to(device)
     opt = torch.optim.AdamW(policy.parameters(), lr=float(cfg["train"]["lr"]))
 
     batch_size = max(1, int(cfg["train"].get("batch_size", 1)))
