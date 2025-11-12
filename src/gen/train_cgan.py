@@ -34,7 +34,7 @@ class SeedPairs(Dataset):
 
 def gradient_penalty(D, real, fake, organ_id, device):
     """Compute the WGAN-GP gradient penalty in float32 for stability."""
-    autocast_ctx = torch.amp.autocast("cuda", enabled=False) if torch.cuda.is_available() else contextlib.nullcontext()
+    autocast_ctx = torch.cuda.amp.autocast(enabled=False) if torch.cuda.is_available() else contextlib.nullcontext()
     with autocast_ctx:
         real32 = real.detach().to(device=device, dtype=torch.float32)
         fake32 = fake.detach().to(device=device, dtype=torch.float32)
@@ -68,27 +68,13 @@ def main():
     optG = torch.optim.AdamW(G.parameters(), lr=cfg["train"]["g_lr"], betas=(0.5,0.9))
     optD = torch.optim.AdamW(D.parameters(), lr=cfg["train"]["d_lr"], betas=(0.5,0.9))
 
-    gp_sdp_context = contextlib.nullcontext
-
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
-        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_math_sdp(False)
-            torch.backends.cuda.enable_mem_efficient_sdp(False)
-            if sdp_kernel_ctx is not None:
-                def gp_sdp_context():
-                    return sdp_kernel_ctx(enable_flash=False, enable_math=True, enable_mem_efficient=False)
-            elif hasattr(torch.backends.cuda, "sdp_kernel"):
-                def gp_sdp_context():
-                    return torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False)
-        elif hasattr(torch.backends.cuda, "sdp_kernel"):
+        if hasattr(torch.backends.cuda, "sdp_kernel"):
             torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False)
-            def gp_sdp_context():
-                return torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False)
 
         def amp_context():
-            return torch.amp.autocast("cuda", dtype=torch.bfloat16)
+            return torch.cuda.amp.autocast(dtype=torch.bfloat16)
     else:
         def amp_context():
             return contextlib.nullcontext()
@@ -107,8 +93,7 @@ def main():
                 d_real = D(xb, org)
                 d_fake = D(y.detach(), org)
                 lossD_core = -(d_real.mean() - d_fake.mean())
-            with gp_sdp_context():
-                gp = gradient_penalty(D, xb, y.detach(), org, device)
+            gp = gradient_penalty(D, xb, y.detach(), org, device)
             lossD = lossD_core.float() + cfg["train"]["gp_lambda"]*gp
             optD.zero_grad()
             lossD.backward()
