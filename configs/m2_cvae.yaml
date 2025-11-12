@@ -1,0 +1,18 @@
+
+seed: 42
+target_organs: "all"
+train:
+  epochs: 20
+  batch_size: 256
+  lr: 2e-4
+  kl_anneal: 0.0003
+  temperature: 1.0
+arch:
+  vocab: "AUGC"
+  max_len_utr5: 512
+  max_len_utr3: 512
+  latent_dim: 128
+  hidden: 512
+  num_layers: 4
+io:
+  out_dir: "outputs/phase2/m2_cvae"

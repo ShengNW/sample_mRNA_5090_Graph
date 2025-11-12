@@ -80,3 +80,4 @@ configs/*.yaml
 !configs/m1_search.yaml
 !configs/m2_cgan.yaml
 !configs/m3_rl.yaml
+!configs/m2_cvae.yaml
