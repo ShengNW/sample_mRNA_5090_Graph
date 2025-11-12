@@ -61,7 +61,7 @@ def maybe_mfe_penalty(seqs):
             except Exception:
                 e = 0.0
             vals.append(e)
-    import numpy as np
+
     arr = np.array(vals, dtype=np.float32)
     if len(arr)!=len(seqs):
         arr = np.pad(arr, (0,len(seqs)-len(arr)))
