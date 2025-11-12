@@ -1,11 +1,12 @@
 
-import argparse, contextlib, yaml
+import argparse, contextlib, inspect, yaml
 from pathlib import Path
 import pandas as pd, torch
 try:
     from torch.nn.attention import sdpa_kernel as sdp_kernel_ctx, SDPBackend
 except ImportError:  # pragma: no cover - fallback for older torch
     sdp_kernel_ctx = None
+    SDPBackend = None
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from src.gen.models.cgan import Generator, Discriminator, VOCAB
@@ -48,6 +49,55 @@ def gradient_penalty(D, real, fake, organ_id, device, sdpa_context):
         gp = ((grad.norm(2, dim=1) - 1) ** 2).mean()
     return gp
 
+def _resolve_sdpa_context(device_type: str):
+    if device_type != "cuda":
+        return contextlib.nullcontext
+
+    sdpa_factory = sdp_kernel_ctx if sdp_kernel_ctx is not None else getattr(
+        torch.backends.cuda, "sdp_kernel", None
+    )
+
+    if sdpa_factory is None:
+        return contextlib.nullcontext
+
+    try:
+        params = inspect.signature(sdpa_factory).parameters
+    except (TypeError, ValueError):  # pragma: no cover - signature introspection failure
+        params = {}
+
+    if "enable_flash" in params:
+        def _ctx():
+            return sdpa_factory(
+                enable_flash=True,
+                enable_mem_efficient=False,
+                enable_math=True,
+            )
+
+        return _ctx
+
+    if "backends" in params or "backend" in params:
+        flash_backend = getattr(SDPBackend, "FLASH_ATTENTION", None)
+        math_backend = getattr(SDPBackend, "MATH", None)
+
+        def _ctx():
+            kwargs = {}
+            if "backends" in params:
+                backends = []
+                if flash_backend is not None:
+                    backends.append(flash_backend)
+                if math_backend is not None:
+                    backends.append(math_backend)
+                if backends:
+                    kwargs["backends"] = tuple(backends)
+            elif "backend" in params and flash_backend is not None:
+                kwargs["backend"] = flash_backend
+            return sdpa_factory(**kwargs)
+
+        return _ctx
+
+    return contextlib.nullcontext
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/m2_cgan.yaml")
@@ -68,30 +118,14 @@ def main():
     optG = torch.optim.AdamW(G.parameters(), lr=cfg["train"]["g_lr"], betas=(0.5,0.9))
     optD = torch.optim.AdamW(D.parameters(), lr=cfg["train"]["d_lr"], betas=(0.5,0.9))
 
+    sdpa_context = _resolve_sdpa_context(device.type)
+
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
-
-        if sdp_kernel_ctx is not None:
-            def sdpa_context():
-                return sdp_kernel_ctx(
-                    enable_flash=True,
-                    enable_mem_efficient=False,
-                    enable_math=True,
-                )
-        else:
-            def sdpa_context():
-                return torch.backends.cuda.sdp_kernel(
-                    enable_flash=True,
-                    enable_mem_efficient=False,
-                    enable_math=True,
-                )
 
         def amp_context():
             return torch.amp.autocast("cuda", dtype=torch.bfloat16)
     else:
-        def sdpa_context():
-            return contextlib.nullcontext()
-
         def amp_context():
             return contextlib.nullcontext()
 
