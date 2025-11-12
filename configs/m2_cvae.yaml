@@ -4,7 +4,7 @@ target_organs: "all"
 train:
   epochs: 20
   batch_size: 256
-  lr: 2e-4
+  lr: 2.0e-4
   kl_anneal: 0.0003
   temperature: 1.0
 arch:

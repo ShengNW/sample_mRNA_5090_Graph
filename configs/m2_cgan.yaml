@@ -3,8 +3,8 @@ seed: 42
 train:
   epochs: 20
   batch_size: 128
-  g_lr: 2e-4
-  d_lr: 2e-4
+  g_lr: 2.0e-4
+  d_lr: 2.0e-4
   gp_lambda: 10.0
   gumbel_tau_start: 1.2
   gumbel_tau_end: 0.5
