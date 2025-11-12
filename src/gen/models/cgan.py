@@ -15,7 +15,7 @@ class Generator(nn.Module):
         self.cond = nn.Embedding(num_organs, hidden)
         self.fc = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU())
         self.tr = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=hidden, nhead=8, batch_first=True),
+            nn.TransformerEncoderLayer(d_model=hidden, nhead=8, dropout=0.0, batch_first=True),
             num_layers=num_layers
         )
         self.proj = nn.Linear(hidden, V)
@@ -36,7 +36,7 @@ class Discriminator(nn.Module):
         self.embed = nn.Linear(V, hidden)
         self.cond = nn.Embedding(num_organs, hidden)
         self.tr = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=hidden, nhead=8, batch_first=True),
+            nn.TransformerEncoderLayer(d_model=hidden, nhead=8, dropout=0.0, batch_first=True),
             num_layers=num_layers
         )
         self.head = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 1))

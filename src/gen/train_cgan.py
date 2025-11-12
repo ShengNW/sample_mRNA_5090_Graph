@@ -1,5 +1,5 @@
 
-import argparse, yaml
+import argparse, contextlib, yaml
 from pathlib import Path
 import pandas as pd, torch
 from torch.utils.data import DataLoader, Dataset
@@ -29,14 +29,20 @@ class SeedPairs(Dataset):
         return x, int(r.organ_id)
 
 def gradient_penalty(D, real, fake, organ_id, device):
-    alpha = torch.rand(real.size(0), 1, 1, device=device)
-    interp = (alpha*real + (1-alpha)*fake).requires_grad_(True)
-    d_interp = D(interp, organ_id)
-    grad = torch.autograd.grad(outputs=d_interp, inputs=interp,
-                               grad_outputs=torch.ones_like(d_interp),
-                               create_graph=True, retain_graph=True, only_inputs=True)[0]
-    grad = grad.view(grad.size(0), -1)
-    return ((grad.norm(2, dim=1) - 1) ** 2).mean()
+    """Compute the WGAN-GP gradient penalty in float32 for stability."""
+    autocast_ctx = torch.cuda.amp.autocast(enabled=False) if torch.cuda.is_available() else contextlib.nullcontext()
+    with autocast_ctx:
+        real32 = real.detach().to(device=device, dtype=torch.float32)
+        fake32 = fake.detach().to(device=device, dtype=torch.float32)
+        alpha = torch.rand(real32.size(0), 1, 1, device=device, dtype=torch.float32)
+        interp = (alpha*real32 + (1-alpha)*fake32).requires_grad_(True)
+        d_interp = D(interp, organ_id)
+        grad = torch.autograd.grad(outputs=d_interp, inputs=interp,
+                                   grad_outputs=torch.ones_like(d_interp),
+                                   create_graph=True, retain_graph=True, only_inputs=True)[0]
+        grad = grad.view(grad.size(0), -1)
+        gp = ((grad.norm(2, dim=1) - 1) ** 2).mean()
+    return gp
 
 def main():
     ap = argparse.ArgumentParser()
@@ -50,7 +56,7 @@ def main():
     df = pd.read_csv(args.seed_csv)
     num_organs = int(df["organ_id"].max())+1 if "organ_id" in df.columns else 32
     ds = SeedPairs(df, L5, L3)
-    dl = DataLoader(ds, batch_size=cfg["train"]["batch_size"], shuffle=True, num_workers=2)
+    dl = DataLoader(ds, batch_size=cfg["train"]["batch_size"], shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
 
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     G = Generator(L5,L3, hidden=cfg["arch"]["hidden"], num_layers=cfg["arch"]["num_layers"], num_organs=num_organs).to(device)
@@ -58,24 +64,45 @@ def main():
     optG = torch.optim.AdamW(G.parameters(), lr=cfg["train"]["g_lr"], betas=(0.5,0.9))
     optD = torch.optim.AdamW(D.parameters(), lr=cfg["train"]["d_lr"], betas=(0.5,0.9))
 
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends.cuda, "sdp_kernel"):
+            torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False)
+
+        def amp_context():
+            return torch.cuda.amp.autocast(dtype=torch.bfloat16)
+    else:
+        def amp_context():
+            return contextlib.nullcontext()
+
     tau = float(cfg["train"]["gumbel_tau_start"]); tau_end = float(cfg["train"]["gumbel_tau_end"])
 
     for epoch in range(cfg["train"]["epochs"]):
         for xb, org in tqdm(dl, desc=f"CGAN epoch {epoch+1}"):
-            xb = xb.to(device)      # (B, L, V)
-            org = org.to(device)
+            xb = xb.to(device=device, dtype=torch.float32, non_blocking=True)      # (B, L, V)
+            org = org.to(device, non_blocking=True)
+
             # D
             z = torch.randn(xb.size(0), D.head[0].in_features, device=device)
-            y = G(z, org, tau=tau)          # (B, L, V)
-            d_real = D(xb, org)
-            d_fake = D(y.detach(), org)
+            with amp_context():
+                y = G(z, org, tau=tau)          # (B, L, V)
+                d_real = D(xb, org)
+                d_fake = D(y.detach(), org)
+                lossD_core = -(d_real.mean() - d_fake.mean())
             gp = gradient_penalty(D, xb, y.detach(), org, device)
-            lossD = -(d_real.mean() - d_fake.mean()) + cfg["train"]["gp_lambda"]*gp
-            optD.zero_grad(); lossD.backward(); optD.step()
+            lossD = lossD_core.float() + cfg["train"]["gp_lambda"]*gp
+            optD.zero_grad()
+            lossD.backward()
+            optD.step()
+
             # G
-            d_fake = D(y, org)
-            lossG = -d_fake.mean()
-            optG.zero_grad(); lossG.backward(); optG.step()
+            with amp_context():
+                d_fake = D(y, org)
+                lossG = -d_fake.mean()
+            lossG = lossG.float()
+            optG.zero_grad()
+            lossG.backward()
+            optG.step()
         tau = max(tau_end, tau*0.95)
         torch.save(G.state_dict(), out/f"cganG_epoch{epoch+1}.pt")
     print(f"[CGAN] Done. Weights under {out}")
