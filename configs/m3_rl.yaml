@@ -2,7 +2,7 @@
 seed: 42
 train:
   steps: 100000
-  batch_size: 1024
+  batch_size: 16
   lr: 3e-4
   gamma: 0.99
   clip_eps: 0.2
@@ -21,3 +21,9 @@ env:
     penalty_invalid_token: 5.0
 io:
   out_dir: "outputs/phase2/m3_rl"
+model:
+  hidden: 256
+  layers: 4
+  heads: 4
+  dropout: 0.1
+  num_organs: 128
