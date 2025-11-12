@@ -32,10 +32,10 @@ class SeedPairs(Dataset):
         x = torch.cat([x5, x3], dim=-1).squeeze(0).transpose(0,1)  # (L,V)
         return x, int(r.organ_id)
 
-def gradient_penalty(D, real, fake, organ_id, device):
+def gradient_penalty(D, real, fake, organ_id, device, sdpa_context):
     """Compute the WGAN-GP gradient penalty in float32 for stability."""
-    autocast_ctx = torch.cuda.amp.autocast(enabled=False) if torch.cuda.is_available() else contextlib.nullcontext()
-    with autocast_ctx:
+    autocast_ctx = torch.amp.autocast("cuda", enabled=False) if torch.cuda.is_available() else contextlib.nullcontext()
+    with sdpa_context(), autocast_ctx:
         real32 = real.detach().to(device=device, dtype=torch.float32)
         fake32 = fake.detach().to(device=device, dtype=torch.float32)
         alpha = torch.rand(real32.size(0), 1, 1, device=device, dtype=torch.float32)
@@ -70,12 +70,28 @@ def main():
 
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
-        if hasattr(torch.backends.cuda, "sdp_kernel"):
-            torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False)
+
+        if sdp_kernel_ctx is not None:
+            def sdpa_context():
+                return sdp_kernel_ctx(
+                    enable_flash=True,
+                    enable_mem_efficient=False,
+                    enable_math=True,
+                )
+        else:
+            def sdpa_context():
+                return torch.backends.cuda.sdp_kernel(
+                    enable_flash=True,
+                    enable_mem_efficient=False,
+                    enable_math=True,
+                )
 
         def amp_context():
-            return torch.cuda.amp.autocast(dtype=torch.bfloat16)
+            return torch.amp.autocast("cuda", dtype=torch.bfloat16)
     else:
+        def sdpa_context():
+            return contextlib.nullcontext()
+
         def amp_context():
             return contextlib.nullcontext()
 
@@ -88,19 +104,19 @@ def main():
 
             # D
             z = torch.randn(xb.size(0), D.head[0].in_features, device=device)
-            with amp_context():
+            with sdpa_context(), amp_context():
                 y = G(z, org, tau=tau)          # (B, L, V)
                 d_real = D(xb, org)
                 d_fake = D(y.detach(), org)
                 lossD_core = -(d_real.mean() - d_fake.mean())
-            gp = gradient_penalty(D, xb, y.detach(), org, device)
+            gp = gradient_penalty(D, xb, y.detach(), org, device, sdpa_context)
             lossD = lossD_core.float() + cfg["train"]["gp_lambda"]*gp
             optD.zero_grad()
             lossD.backward()
             optD.step()
 
             # G
-            with amp_context():
+            with sdpa_context(), amp_context():
                 d_fake = D(y, org)
                 lossG = -d_fake.mean()
             lossG = lossG.float()
