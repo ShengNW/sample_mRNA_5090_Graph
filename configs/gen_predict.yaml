@@ -1,0 +1,6 @@
+
+phase1_checkpoint: "Phase1output/cnn_film_rbp_trna_best.pt"
+dataset_dir: "data/processed/seq_cnn_v1_rbp_trna"
+device: "cuda"
+batch_size: 512
+num_workers: 4

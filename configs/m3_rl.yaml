@@ -1,0 +1,23 @@
+
+seed: 42
+train:
+  steps: 100000
+  batch_size: 1024
+  lr: 3e-4
+  gamma: 0.99
+  clip_eps: 0.2
+  update_epochs: 4
+  entropy_coef: 0.005
+env:
+  vocab: "AUGC"
+  max_len_utr5: 256
+  max_len_utr3: 256
+  target_organ: 0
+  reward:
+    expr_weight: 1.0
+    specificity_weight: 0.5
+    penalty_motif: 2.0
+    penalty_homopolymer: 1.0
+    penalty_invalid_token: 5.0
+io:
+  out_dir: "outputs/phase2/m3_rl"

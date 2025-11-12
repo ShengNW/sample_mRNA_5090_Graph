@@ -76,3 +76,7 @@ configs/*.yaml
 !configs/train_cnn_regression_norm_000_3.yaml
 !configs/dataset.yaml
 !configs/train_rbp_trna.yaml
+!configs/gen_predict.yaml
+!configs/m1_search.yaml
+!configs/m2_cgan.yaml
+!configs/m3_rl.yaml

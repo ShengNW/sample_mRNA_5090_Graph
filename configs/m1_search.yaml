@@ -1,0 +1,23 @@
+
+seed: 42
+target_organ: 0
+max_len_utr5: 512
+max_len_utr3: 512
+population_size: 2048
+steps: 200
+mutation_rate: 0.08
+recomb_rate: 0.25
+elitism: 0.02
+constraint:
+  gc_min: 0.35
+  gc_max: 0.65
+  ban_homopolymers: 6
+  ban_motifs: ["TTTTTT", "AAAAAA"]
+score:
+  expr_weight: 1.0
+  specificity_weight: 0.5
+  mfe_weight: 0.1
+io:
+  seed_csv: "outputs/phase2/m1/seed_pool.csv"
+  out_dir: "outputs/phase2/m1"
+  topk_export: 2000

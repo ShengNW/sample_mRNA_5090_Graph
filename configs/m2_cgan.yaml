@@ -1,0 +1,18 @@
+
+seed: 42
+train:
+  epochs: 20
+  batch_size: 128
+  g_lr: 2e-4
+  d_lr: 2e-4
+  gp_lambda: 10.0
+  gumbel_tau_start: 1.2
+  gumbel_tau_end: 0.5
+arch:
+  vocab: "AUGC"
+  max_len_utr5: 256
+  max_len_utr3: 256
+  hidden: 512
+  num_layers: 6
+io:
+  out_dir: "outputs/phase2/m2_cgan"
