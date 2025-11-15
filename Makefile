@@ -4,8 +4,8 @@
 PY=python
 
 mfe:
-	$(PY) scripts/calc_mfe.py --input data/raw/predict_eval.csv --output data/derived/mfe_predict.csv
-	$(PY) scripts/calc_mfe.py --input data/raw/generated_topk.csv --output data/derived/mfe_generated.csv
+	$(PY) -u scripts/calc_mfe.py --input data/raw/predict_eval.csv --output data/derived/mfe_predict.csv
+	$(PY) -u scripts/calc_mfe.py --input data/raw/generated_topk.csv --output data/derived/mfe_generated.csv
 
 rbp:
 	$(PY) scripts/scan_rbp_fimo.py --input data/raw/predict_eval.csv --output data/derived/rbp_predict.csv
