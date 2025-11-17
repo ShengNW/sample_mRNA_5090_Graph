@@ -2,14 +2,15 @@
 .PHONY: mfe rbp fig2 fig3 all
 
 PY=python
+RBP_MOTIFS=data/external/rbp/Ray2013_rbp_Homo_sapiens.meme
 
 mfe:
-	$(PY) scripts/calc_mfe.py --input data/raw/predict_eval.csv --output data/derived/mfe_predict.csv
-	$(PY) scripts/calc_mfe.py --input data/raw/generated_topk.csv --output data/derived/mfe_generated.csv
+	$(PY) -u scripts/calc_mfe.py --input data/raw/predict_eval.csv --output data/derived/mfe_predict.csv
+	$(PY) -u scripts/calc_mfe.py --input data/raw/generated_topk.csv --output data/derived/mfe_generated.csv
 
 rbp:
-	$(PY) scripts/scan_rbp_fimo.py --input data/raw/predict_eval.csv --output data/derived/rbp_predict.csv
-	$(PY) scripts/scan_rbp_fimo.py --input data/raw/generated_topk.csv --output data/derived/rbp_generated.csv
+	$(PY) scripts/scan_rbp_fimo.py --input data/raw/predict_eval.csv --motifs $(RBP_MOTIFS) --output data/derived/rbp_predict.csv
+	$(PY) scripts/scan_rbp_fimo.py --input data/raw/generated_topk.csv --motifs $(RBP_MOTIFS) --output data/derived/rbp_generated.csv
 
 fig2:
 	$(PY) scripts/eval_predictor.py --pred data/raw/predict_eval.csv --mfe data/derived/mfe_predict.csv --rbp data/derived/rbp_predict.csv --outdir figs/outputs

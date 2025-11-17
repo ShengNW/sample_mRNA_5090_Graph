@@ -24,8 +24,16 @@ def run_fimo(meme_motifs, fasta_path, out_dir):
         if len(parts) >= 9:
             motif_id = parts[0]
             sequence_id = parts[1]
-            pval = float(parts[7])
-            qval = float(parts[8]) if parts[8] not in ("", "NA") else None
+            try:
+                pval = float(parts[7])
+            except ValueError:
+                continue
+            qval = None
+            if parts[8] not in ("", "NA"):
+                try:
+                    qval = float(parts[8])
+                except ValueError:
+                    qval = None
             rows.append((sequence_id, motif_id, pval, qval))
     df = pd.DataFrame(rows, columns=["seq_id","motif","pval","qval"])
     return df
