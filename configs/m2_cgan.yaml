@@ -2,7 +2,7 @@
 seed: 42
 train:
   epochs: 20
-  batch_size: 128
+  batch_size: 32
   g_lr: 2.0e-4
   d_lr: 2.0e-4
   gp_lambda: 10.0
