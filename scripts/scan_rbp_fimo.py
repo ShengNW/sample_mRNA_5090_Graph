@@ -1,10 +1,23 @@
+
 """
 使用 FIMO（MEME Suite）扫描 RBP PWM 位点。
 需要本机已安装 `fimo`，并提供 `--motifs`（MEME 格式）文件。
 输出列：seq_id, rbp_hits_total, rbp_hits_per_kb
 """
 import argparse, os, pandas as pd, subprocess, tempfile
+from pathlib import Path
 from utils import read_csv_required, save_merged_csv
+
+
+
+def ensure_seq_id(df, prefix):
+    if "seq_id" in df.columns:
+        return df
+    df = df.copy()
+    df.insert(0, "seq_id", [f"{prefix}_{i:06d}" for i in range(len(df))])
+    return df
+
+
 
 def write_fasta(df, fasta_path):
     with open(fasta_path, "w") as f:
@@ -12,13 +25,15 @@ def write_fasta(df, fasta_path):
             seq = (str(row.get("utr5","")) + str(row.get("utr3",""))).replace("U","T")
             f.write(f">{row['seq_id']}\n{seq}\n")
 
+
+
 def run_fimo(meme_motifs, fasta_path, out_dir):
     cmd = ["fimo", "--verbosity", "1", "--text", meme_motifs, fasta_path]
     res = subprocess.run(cmd, capture_output=True, text=True, check=True)
     # 解析 TSV 风格输出（文本模式）
     rows = []
     for ln in res.stdout.splitlines():
-        if ln.startswith("#") or not ln.strip(): 
+        if ln.startswith("#") or not ln.strip():
             continue
         parts = ln.split('\t')
         if len(parts) >= 9:
@@ -39,6 +54,8 @@ def run_fimo(meme_motifs, fasta_path, out_dir):
     df = pd.DataFrame(rows, columns=["seq_id","motif","pval","qval"])
     return df
 
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
@@ -46,7 +63,8 @@ def main():
     ap.add_argument("--output", required=True)
     args = ap.parse_args()
 
-    df = read_csv_required(args.input, ["seq_id"])
+    df = read_csv_required(args.input, [])
+    df = ensure_seq_id(df, Path(args.input).stem)
     with tempfile.TemporaryDirectory() as td:
         fa = os.path.join(td, "seqs.fa")
         write_fasta(df, fa)
@@ -66,6 +84,7 @@ def main():
 
     save_merged_csv(merged, args.output)
     print(f"Saved {args.output}")
+
 
 if __name__ == "__main__":
     main()
