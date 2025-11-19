@@ -23,7 +23,8 @@ def run_fimo(meme_motifs, fasta_path, out_dir):
         parts = ln.split('\t')
         if len(parts) >= 9:
             motif_id = parts[0]
-            sequence_id = parts[1]
+            # FIMO columns: motif_id, motif_alt_id, sequence_name, start, stop, strand, score, p-value, q-value, match
+            sequence_id = parts[2]
             try:
                 pval = float(parts[7])
             except ValueError:
@@ -54,7 +55,14 @@ def main():
     # 聚合
     agg = hits.groupby("seq_id").size().rename("rbp_hits_total").reset_index()
     merged = df[["seq_id"]].merge(agg, on="seq_id", how="left").fillna({"rbp_hits_total":0})
-    merged["rbp_hits_per_kb"] = merged["rbp_hits_total"] / ((df.get("utr5","").str.len().fillna(0) + df.get("utr3","").str.len().fillna(0)).replace(0,1)/1000)
+
+    def len_series(col):
+        if col in df.columns:
+            return df[col].fillna("").astype(str).str.len()
+        return pd.Series(0, index=df.index)
+
+    total_len = (len_series("utr5") + len_series("utr3")).replace(0, 1)
+    merged["rbp_hits_per_kb"] = merged["rbp_hits_total"] / (total_len / 1000)
 
     save_merged_csv(merged, args.output)
     print(f"Saved {args.output}")
